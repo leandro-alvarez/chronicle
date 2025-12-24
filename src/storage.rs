@@ -3,27 +3,21 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use crate::event::EventEnvelope;
+use crate::event::{Event, StoredEvent};
 
 /// Maps aggregate IDs to their event offsets in the log.
 pub type AggregateIndex = HashMap<u64, Vec<u64>>;
 
-struct ReadEvent {
+struct ReadResult {
     offset: u64,
-    event: EventEnvelope,
+    event: StoredEvent,
 }
 
-fn open_file_for_read_or_fail<P: AsRef<Path>>(path: P) -> Result<fs::File, io::Error> {
-    match OpenOptions::new().read(true).open(path) {
-        Ok(f) => return Ok(f),
-        Err(err) => {
-            println!("Error opening file {}", err);
-            return Err(err);
-        }
-    };
+fn open_file_for_read<P: AsRef<Path>>(path: P) -> Result<fs::File, io::Error> {
+    OpenOptions::new().read(true).open(path)
 }
 
-fn read_event_at_offset(file: &mut File, offset: Option<u64>) -> Result<ReadEvent, io::Error> {
+fn read_event_at_offset(file: &mut File, offset: Option<u64>) -> Result<ReadResult, io::Error> {
     if let Some(off) = offset {
         file.seek(SeekFrom::Start(off))?;
     }
@@ -35,18 +29,18 @@ fn read_event_at_offset(file: &mut File, offset: Option<u64>) -> Result<ReadEven
     let mut event_buf = vec![0u8; length];
     file.read_exact(&mut event_buf)?;
 
-    Ok(ReadEvent {
+    Ok(ReadResult {
         offset: returned_offset,
         event: serde_json::from_slice(&event_buf)?,
     })
 }
 
-fn scan_log<P: AsRef<Path>>(path: P) -> Result<Vec<(u64, EventEnvelope)>, io::Error> {
-    let mut file = open_file_for_read_or_fail(path)?;
+fn scan_log<P: AsRef<Path>>(path: P) -> Result<Vec<(u64, StoredEvent)>, io::Error> {
+    let mut file = open_file_for_read(path)?;
     let mut entries = vec![];
     loop {
-        let read_event = match read_event_at_offset(&mut file, None) {
-            Ok(re) => re,
+        let result = match read_event_at_offset(&mut file, None) {
+            Ok(r) => r,
             Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
                 // Clean EOF at entry boundary
                 return Ok(entries);
@@ -56,17 +50,28 @@ fn scan_log<P: AsRef<Path>>(path: P) -> Result<Vec<(u64, EventEnvelope)>, io::Er
                 return Err(err);
             }
         };
-        entries.push((read_event.offset, read_event.event));
+        entries.push((result.offset, result.event));
     }
 }
 
-pub fn append_event<P: AsRef<Path>>(path: P, event: &EventEnvelope) -> std::io::Result<u64> {
+pub fn append_event<P: AsRef<Path>>(path: P, event: &Event) -> std::io::Result<u64> {
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
 
     // Record offset before writing
     let offset = file.seek(SeekFrom::End(0))?;
 
-    let json = serde_json::to_vec(event)?;
+    // Chronicle sets the write timestamp
+    let write_timestamp_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before 1970")
+        .as_millis() as u64;
+
+    let stored_event = StoredEvent {
+        write_timestamp_ms,
+        event: event.clone(),
+    };
+
+    let json = serde_json::to_vec(&stored_event)?;
     let len = json.len() as u32;
 
     file.write_all(&len.to_be_bytes())?;
@@ -80,8 +85,8 @@ pub fn load_aggregate<P: AsRef<Path>>(
     path: P,
     aggregate_id: u64,
     index: &AggregateIndex,
-) -> Result<Vec<EventEnvelope>, io::Error> {
-    let mut file = open_file_for_read_or_fail(path)?;
+) -> Result<Vec<StoredEvent>, io::Error> {
+    let mut file = open_file_for_read(path)?;
     let mut results = vec![];
 
     let offsets = match index.get(&aggregate_id) {
@@ -90,8 +95,8 @@ pub fn load_aggregate<P: AsRef<Path>>(
     };
 
     for offset in offsets {
-        let read_event = read_event_at_offset(&mut file, Some(*offset))?;
-        results.push(read_event.event);
+        let result = read_event_at_offset(&mut file, Some(*offset))?;
+        results.push(result.event);
     }
 
     Ok(results)
@@ -100,8 +105,8 @@ pub fn load_aggregate<P: AsRef<Path>>(
 pub fn rebuild_index<P: AsRef<Path>>(path: P) -> Result<AggregateIndex, io::Error> {
     let mut index = AggregateIndex::new();
     let entries = scan_log(path)?;
-    for (offset, event) in entries {
-        if let Some(id) = event.aggregate_id {
+    for (offset, stored_event) in entries {
+        if let Some(id) = stored_event.event.aggregate_id {
             index.entry(id).or_default().push(offset);
         }
     }
@@ -109,10 +114,10 @@ pub fn rebuild_index<P: AsRef<Path>>(path: P) -> Result<AggregateIndex, io::Erro
 }
 
 pub fn read_events<P: AsRef<Path>>(path: P) -> Result<(), io::Error> {
-    let mut file = open_file_for_read_or_fail(path)?;
+    let mut file = open_file_for_read(path)?;
     loop {
-        let read_event = match read_event_at_offset(&mut file, None) {
-            Ok(re) => re,
+        let result = match read_event_at_offset(&mut file, None) {
+            Ok(r) => r,
             Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
                 // Clean EOF at entry boundary
                 return Ok(());
@@ -122,7 +127,7 @@ pub fn read_events<P: AsRef<Path>>(path: P) -> Result<(), io::Error> {
                 return Err(err);
             }
         };
-        println!("{:?} at offset {}", read_event.event, read_event.offset);
+        println!("{:?} at offset {}", result.event, result.offset);
     }
 }
 
@@ -132,18 +137,12 @@ mod tests {
 
     use super::*;
 
-    fn mock_event(id: u64) -> EventEnvelope {
-        let ts = chrono::Utc::now()
-            .timestamp_millis()
-            .try_into()
-            .expect("system clock before 1970");
-
-        EventEnvelope {
+    fn mock_event(id: u64) -> Event {
+        Event {
             aggregate_id: Some(id),
             schema_id: "Test".into(),
             schema_version: 1,
             namespace: "test".into(),
-            timestamp_ms: ts,
             event_type: "Test".into(),
             payload: json!({
                 "name": "string",
@@ -212,8 +211,8 @@ mod tests {
         let events = scan_log(path).unwrap();
 
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].1.aggregate_id, Some(1));
-        assert_eq!(events[1].1.aggregate_id, Some(1));
+        assert_eq!(events[0].1.event.aggregate_id, Some(1));
+        assert_eq!(events[1].1.event.aggregate_id, Some(1));
     }
 
     #[test]
@@ -255,20 +254,15 @@ mod tests {
     }
 
     #[test]
-    fn load_aggregate_preserves_order() {
+    fn load_aggregate_preserves_append_order() {
         use tempfile::NamedTempFile;
 
         let file = NamedTempFile::new().unwrap();
         let path = file.path();
 
-        // Create events with explicit timestamps
-        let mut e1 = mock_event(1);
-        let mut e2 = mock_event(1);
-        let mut e3 = mock_event(1);
-
-        e1.timestamp_ms = 100;
-        e2.timestamp_ms = 50; // earlier timestamp, but appended later
-        e3.timestamp_ms = 150;
+        let e1 = mock_event(1);
+        let e2 = mock_event(1);
+        let e3 = mock_event(1);
 
         append_event(path, &e1).unwrap();
         append_event(path, &e2).unwrap();
@@ -279,10 +273,9 @@ mod tests {
 
         assert_eq!(events.len(), 3);
 
-        // Order must match append order, not timestamp order
-        assert_eq!(events[0].timestamp_ms, 100);
-        assert_eq!(events[1].timestamp_ms, 50);
-        assert_eq!(events[2].timestamp_ms, 150);
+        // Timestamps should be in ascending order (Chronicle sets them on append)
+        assert!(events[0].write_timestamp_ms <= events[1].write_timestamp_ms);
+        assert!(events[1].write_timestamp_ms <= events[2].write_timestamp_ms);
     }
 
     #[test]

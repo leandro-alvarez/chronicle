@@ -158,7 +158,7 @@ No need to store timestamps in the index — the event payload contains it when 
 
 ### Chronicle Controls `write_timestamp_ms`
 
-The `write_timestamp_ms` field is set by Chronicle when the event is appended, not by the caller.
+The `write_timestamp_ms` field is set by Chronicle when the event is appended, not by the caller. This is enforced through separate input/output types.
 
 | Field | Who controls | Purpose |
 |-------|--------------|---------|
@@ -174,16 +174,22 @@ The `write_timestamp_ms` field is set by Chronicle when the event is appended, n
 
 If a caller needs "when the event occurred" (business time), they put it in the payload.
 
-**Updated EventEnvelope:**
+**Implementation (DONE):**
 ```rust
-pub struct EventEnvelope {
+/// Input: provided by caller
+pub struct Event {
     pub event_type: String,
     pub namespace: String,
     pub schema_id: String,
     pub schema_version: u32,
     pub aggregate_id: Option<u64>,
-    pub write_timestamp_ms: u64,  // set by Chronicle, not caller
     pub payload: Value,
+}
+
+/// Output: returned when reading from log
+pub struct StoredEvent {
+    pub write_timestamp_ms: u64,  // set by Chronicle
+    pub event: Event,
 }
 ```
 
