@@ -1,28 +1,17 @@
 use std::collections::HashMap;
-use std::fmt::Debug;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::event::EventEnvelope;
 
-pub struct IndexedEvent {
-    timestamp: u64,
-    offset: u64,
-}
-
-impl Debug for IndexedEvent {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "({}, {})", self.timestamp, self.offset)
-    }
-}
+/// Maps aggregate IDs to their event offsets in the log.
+pub type AggregateIndex = HashMap<u64, Vec<u64>>;
 
 struct ReadEvent {
     offset: u64,
     event: EventEnvelope,
 }
-
-type AggregateIndex = HashMap<u64, Vec<IndexedEvent>>;
 
 fn open_file_for_read_or_fail<P: AsRef<Path>>(path: P) -> Result<fs::File, io::Error> {
     match OpenOptions::new().read(true).open(path) {
@@ -52,26 +41,22 @@ fn read_event_at_offset(file: &mut File, offset: Option<u64>) -> Result<ReadEven
     })
 }
 
-fn scan_log<P: AsRef<Path>>(path: P) -> Result<Vec<(u64, u64, EventEnvelope)>, io::Error> {
+fn scan_log<P: AsRef<Path>>(path: P) -> Result<Vec<(u64, EventEnvelope)>, io::Error> {
     let mut file = open_file_for_read_or_fail(path)?;
-    let mut offset_events_vector = vec![];
+    let mut entries = vec![];
     loop {
         let read_event = match read_event_at_offset(&mut file, None) {
             Ok(re) => re,
             Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
                 // Clean EOF at entry boundary
-                return Ok(offset_events_vector);
+                return Ok(entries);
             }
             Err(err) => {
                 println!("Error reading file {}", err);
                 return Err(err);
             }
         };
-        offset_events_vector.push((
-            read_event.event.timestamp_ms,
-            read_event.offset,
-            read_event.event,
-        ));
+        entries.push((read_event.offset, read_event.event));
     }
 }
 
@@ -99,16 +84,12 @@ pub fn load_aggregate<P: AsRef<Path>>(
     let mut file = open_file_for_read_or_fail(path)?;
     let mut results = vec![];
 
-    let offset_list = match index.get(&aggregate_id) {
+    let offsets = match index.get(&aggregate_id) {
         Some(list) => list,
         None => return Ok(vec![]),
     };
 
-    for IndexedEvent {
-        timestamp: _timestamp,
-        offset,
-    } in offset_list
-    {
+    for offset in offsets {
         let read_event = read_event_at_offset(&mut file, Some(*offset))?;
         results.push(read_event.event);
     }
@@ -118,18 +99,10 @@ pub fn load_aggregate<P: AsRef<Path>>(
 
 pub fn rebuild_index<P: AsRef<Path>>(path: P) -> Result<AggregateIndex, io::Error> {
     let mut index = AggregateIndex::new();
-    let timestamp_offset_list = scan_log(path)?;
-    for (timestamp, offset, event) in timestamp_offset_list {
-        match event.aggregate_id {
-            Some(id) => {
-                if index.contains_key(&id) {
-                    let offset_list = index.get_mut(&id).unwrap();
-                    offset_list.push(IndexedEvent { timestamp, offset });
-                } else {
-                    index.insert(id, vec![IndexedEvent { timestamp, offset }]);
-                };
-            }
-            _ => (),
+    let entries = scan_log(path)?;
+    for (offset, event) in entries {
+        if let Some(id) = event.aggregate_id {
+            index.entry(id).or_default().push(offset);
         }
     }
     Ok(index)
@@ -197,8 +170,8 @@ mod tests {
         let events = scan_log(path).unwrap();
         assert_eq!(events.len(), 2);
 
-        assert_eq!(events[0].1, off1);
-        assert_eq!(events[1].1, off2);
+        assert_eq!(events[0].0, off1);
+        assert_eq!(events[1].0, off2);
     }
 
     #[test]
@@ -239,8 +212,8 @@ mod tests {
         let events = scan_log(path).unwrap();
 
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].2.aggregate_id, Some(1));
-        assert_eq!(events[1].2.aggregate_id, Some(1));
+        assert_eq!(events[0].1.aggregate_id, Some(1));
+        assert_eq!(events[1].1.aggregate_id, Some(1));
     }
 
     #[test]

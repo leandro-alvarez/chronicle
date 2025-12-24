@@ -1,172 +1,109 @@
 # Storage Module Refactoring
 
-This document outlines refactoring opportunities for `src/storage.rs`.
-
-## Issues
-
-### 1. No Stateful Struct
-
-**Severity:** High | **Effort:** Medium
-
-All functions are standalone and require passing the path on every call. This leads to:
-- Reopening the file on every operation
-- No way to hold state (like a cached index)
-
-**Current:**
-```rust
-append_event("events.log", &event)?;
-let index = rebuild_index("events.log")?;
-let events = load_aggregate("events.log", 1, &index)?;
-```
-
-**Proposed:**
-```rust
-let log = EventLog::open("events.log")?;
-log.append(&event)?;
-let events = log.load_aggregate(1)?;
-```
+Immediate code quality fixes for `src/storage.rs`. For feature work, see [roadmap.md](./roadmap.md).
 
 ---
 
-### 2. `println!` in Library Code
+## 1. Remove `println!` from Library Code
 
-**Severity:** Medium | **Effort:** Low
+**Severity:** Medium | **Effort:** Low | **Status:** TODO
 
-**Locations:** lines 31, 66, 148, 152
+**Locations:** lines 20, 55, 125, 129
 
 Library code should not print to stdout. Callers should decide how to handle errors.
 
-The `read_events` function (line 138) only prints events and doesn't return them, making it unusable as a library function.
+The `read_events` function (line 115) only prints events and doesn't return them, making it unusable as a library function.
 
-**Fix:** Remove all `println!` calls. Either return errors to the caller or use a logging crate like `tracing` or `log`.
-
----
-
-### 3. Visibility Issues
-
-**Severity:** Medium | **Effort:** Low
-
-- `AggregateIndex` (line 25) is private, but `rebuild_index` returns it and `load_aggregate` takes it as a parameter. Users cannot properly type their code.
-- `IndexedEvent` is public but its fields (`timestamp`, `offset`) are private, making it unusable to consumers.
-
-**Fix:** Either make `AggregateIndex` public or encapsulate it within a struct. Make `IndexedEvent` fields public or provide accessor methods.
+**Fix:** Remove all `println!` calls. Return errors to the caller. Consider removing `read_events` entirely or making it return `Vec<EventEnvelope>`.
 
 ---
 
-### 4. Non-Idiomatic Rust Patterns
+## ~~2. Fix Visibility Issues~~
+
+**Status:** DONE
+
+- Made `AggregateIndex` public
+- Removed `IndexedEvent` struct entirely
+- Simplified to `pub type AggregateIndex = HashMap<u64, Vec<u64>>`
+
+---
+
+## 3. Use Idiomatic Rust Patterns
 
 **Severity:** Low | **Effort:** Low
 
-#### 4a. Use `entry` API (lines 125-130)
+### ~~3a. Use `entry` API~~
+
+**Status:** DONE (fixed during item 2)
+
+### ~~3b. Use `if let` instead of match~~
+
+**Status:** DONE (fixed during item 2)
+
+### 3c. Simplify `open_file_for_read_or_fail` (lines 16-24)
+
+**Status:** TODO
 
 **Current:**
 ```rust
-if index.contains_key(&id) {
-    let offset_list = index.get_mut(&id).unwrap();
-    offset_list.push(IndexedEvent { timestamp, offset });
-} else {
-    index.insert(id, vec![IndexedEvent { timestamp, offset }]);
+fn open_file_for_read_or_fail<P: AsRef<Path>>(path: P) -> Result<fs::File, io::Error> {
+    match OpenOptions::new().read(true).open(path) {
+        Ok(f) => return Ok(f),
+        Err(err) => {
+            println!("Error opening file {}", err);
+            return Err(err);
+        }
+    };
 }
 ```
 
 **Proposed:**
 ```rust
-index.entry(id).or_default().push(IndexedEvent { timestamp, offset });
+fn open_file_for_read<P: AsRef<Path>>(path: P) -> Result<fs::File, io::Error> {
+    OpenOptions::new().read(true).open(path)
+}
 ```
 
-#### 4b. Use `if let` instead of match with unit arm (line 123)
+---
+
+## 4. Rename `timestamp_ms` to `write_timestamp_ms`
+
+**Severity:** Medium | **Effort:** Low | **Status:** TODO
+
+**File:** `src/event.rs`
+
+The `timestamp_ms` field should be renamed to `write_timestamp_ms` and set by Chronicle on append, not by the caller.
+
+See [roadmap.md](./roadmap.md#chronicle-controls-write_timestamp_ms) for rationale.
 
 **Current:**
 ```rust
-match event.aggregate_id {
-    Some(id) => { ... }
-    _ => ()
+pub struct EventEnvelope {
+    // ...
+    pub timestamp_ms: u64,  // caller provides
+    // ...
 }
 ```
 
 **Proposed:**
 ```rust
-if let Some(id) = event.aggregate_id {
-    ...
+pub struct EventEnvelope {
+    // ...
+    pub write_timestamp_ms: u64,  // Chronicle sets on append
+    // ...
 }
 ```
 
----
-
-### 5. Durability: `flush` vs `sync_all`
-
-**Severity:** Medium | **Effort:** Low
-
-**Location:** line 89
-
-Currently uses `flush()` which only flushes to the OS buffer. For true crash safety, `sync_all()` ensures data reaches the physical disk.
-
-**Fix:** Replace `file.flush()` with `file.sync_all()` for durability guarantees.
-
----
-
-### 6. Generic Error Type
-
-**Severity:** Low | **Effort:** Medium
-
-Using `io::Error` for everything (including JSON parse errors) loses error context.
-
-**Proposed:**
-```rust
-#[derive(Debug)]
-pub enum StorageError {
-    Io(std::io::Error),
-    Serialization(serde_json::Error),
-}
-
-impl From<std::io::Error> for StorageError {
-    fn from(err: std::io::Error) -> Self {
-        StorageError::Io(err)
-    }
-}
-
-impl From<serde_json::Error> for StorageError {
-    fn from(err: serde_json::Error) -> Self {
-        StorageError::Serialization(err)
-    }
-}
-```
-
-Alternatively, use the `thiserror` crate for less boilerplate.
-
----
-
-### 7. No Iterator API
-
-**Severity:** Low | **Effort:** Medium
-
-`scan_log` loads all events into memory. For large logs, an iterator-based approach would be more memory-efficient.
-
-**Proposed:**
-```rust
-pub struct EventIterator<'a> {
-    file: &'a mut File,
-}
-
-impl Iterator for EventIterator<'_> {
-    type Item = Result<EventEnvelope, StorageError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // Read next event or return None at EOF
-    }
-}
-```
+This also requires updating `append_event` to set the timestamp instead of trusting the caller.
 
 ---
 
 ## Summary
 
-| Issue | Severity | Effort |
-|-------|----------|--------|
-| No stateful struct | High | Medium |
-| `println!` in library | Medium | Low |
-| Visibility (`AggregateIndex`, `IndexedEvent`) | Medium | Low |
-| Non-idiomatic Rust | Low | Low |
-| `flush` vs `sync_all` | Medium | Low |
-| Generic `io::Error` | Low | Medium |
-| No iterator API | Low | Medium |
+| Issue | Status |
+|-------|--------|
+| Remove `println!` calls | TODO |
+| Simplify `AggregateIndex` to offsets only | DONE |
+| Idiomatic Rust patterns (entry, if let) | DONE |
+| Simplify `open_file_for_read_or_fail` | TODO |
+| Rename `timestamp_ms` to `write_timestamp_ms` | TODO |
