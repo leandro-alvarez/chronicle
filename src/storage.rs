@@ -50,7 +50,6 @@ fn scan_log_entries<P: AsRef<Path>, F: FnMut(u64, StoredEvent)>(
                 break;
             }
             Err(err) => {
-                println!("Error reading file {}", err);
                 return Err(err);
             }
         };
@@ -130,7 +129,6 @@ pub fn read_events<P: AsRef<Path>>(path: P) -> Result<(), io::Error> {
                 return Ok(());
             }
             Err(err) => {
-                println!("Error reading file {}", err);
                 return Err(err);
             }
         };
@@ -214,8 +212,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(seen.len(), 3);
-        println!("{}", seen[0].1.write_timestamp_ms);
-        println!("{}", seen[1].1.write_timestamp_ms);
         assert_eq!(
             seen[0].1.write_timestamp_ms < seen[1].1.write_timestamp_ms,
             true
