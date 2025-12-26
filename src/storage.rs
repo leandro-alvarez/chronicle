@@ -17,6 +17,8 @@ fn open_file_for_read<P: AsRef<Path>>(path: P) -> Result<fs::File, io::Error> {
     OpenOptions::new().read(true).open(path)
 }
 
+/// Reads the event at the current file cursor if offset is None,
+/// and advances the cursor to the start of the next entry.
 fn read_event_at_offset(file: &mut File, offset: Option<u64>) -> Result<ReadResult, io::Error> {
     if let Some(off) = offset {
         file.seek(SeekFrom::Start(off))?;
@@ -35,23 +37,26 @@ fn read_event_at_offset(file: &mut File, offset: Option<u64>) -> Result<ReadResu
     })
 }
 
-fn scan_log<P: AsRef<Path>>(path: P) -> Result<Vec<(u64, StoredEvent)>, io::Error> {
+fn scan_log_entries<P: AsRef<Path>, F: FnMut(u64, StoredEvent)>(
+    path: P,
+    mut f: F,
+) -> Result<(), io::Error> {
     let mut file = open_file_for_read(path)?;
-    let mut entries = vec![];
     loop {
         let result = match read_event_at_offset(&mut file, None) {
             Ok(r) => r,
             Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
                 // Clean EOF at entry boundary
-                return Ok(entries);
+                break;
             }
             Err(err) => {
                 println!("Error reading file {}", err);
                 return Err(err);
             }
         };
-        entries.push((result.offset, result.event));
+        f(result.offset, result.event);
     }
+    Ok(())
 }
 
 pub fn append_event<P: AsRef<Path>>(path: P, event: &Event) -> std::io::Result<u64> {
@@ -104,12 +109,14 @@ pub fn load_aggregate<P: AsRef<Path>>(
 
 pub fn rebuild_index<P: AsRef<Path>>(path: P) -> Result<AggregateIndex, io::Error> {
     let mut index = AggregateIndex::new();
-    let entries = scan_log(path)?;
-    for (offset, stored_event) in entries {
-        if let Some(id) = stored_event.event.aggregate_id {
-            index.entry(id).or_default().push(offset);
+    scan_log_entries(path, |offset, event| {
+        if event.event.aggregate_id.is_some() {
+            index
+                .entry(event.event.aggregate_id.unwrap())
+                .or_default()
+                .push(offset);
         }
-    }
+    })?;
     Ok(index)
 }
 
@@ -133,6 +140,10 @@ pub fn read_events<P: AsRef<Path>>(path: P) -> Result<(), io::Error> {
 
 #[cfg(test)]
 mod tests {
+    use core::time;
+    use std::thread::sleep;
+    use tempfile::NamedTempFile;
+
     use serde_json::json;
 
     use super::*;
@@ -152,7 +163,7 @@ mod tests {
     }
 
     #[test]
-    fn append_and_scan_log() {
+    fn append() {
         use tempfile::NamedTempFile;
 
         let file = NamedTempFile::new().unwrap();
@@ -165,27 +176,84 @@ mod tests {
         let off2 = append_event(path, &e2).unwrap();
 
         assert!(off2 > off1);
-
-        let events = scan_log(path).unwrap();
-        assert_eq!(events.len(), 2);
-
-        assert_eq!(events[0].0, off1);
-        assert_eq!(events[1].0, off2);
     }
 
     #[test]
-    fn scan_empty_file_is_ok() {
+    fn scan_log_entries_with_empty_file_is_ok() {
+        use tempfile::NamedTempFile;
+
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        let mut seen = Vec::new();
+        scan_log_entries(&path, |offset, event| {
+            seen.push((offset, event));
+        })
+        .unwrap();
+        assert!(seen.is_empty());
+    }
+
+    #[test]
+    fn scan_log_entries_reads_all_events() {
+        use tempfile::NamedTempFile;
+
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        let ten_millis = time::Duration::from_millis(10);
+
+        let _ = append_event(path, &mock_event(1));
+        sleep(ten_millis); // We sleep so we can be sure timestamps are different
+        let _ = append_event(path, &mock_event(1));
+        sleep(ten_millis);
+        let _ = append_event(path, &mock_event(2));
+
+        let mut seen = Vec::new();
+
+        scan_log_entries(&path, |offset, event| {
+            seen.push((offset, event));
+        })
+        .unwrap();
+
+        assert_eq!(seen.len(), 3);
+        println!("{}", seen[0].1.write_timestamp_ms);
+        println!("{}", seen[1].1.write_timestamp_ms);
+        assert_eq!(
+            seen[0].1.write_timestamp_ms < seen[1].1.write_timestamp_ms,
+            true
+        );
+        assert_eq!(
+            seen[1].1.write_timestamp_ms < seen[2].1.write_timestamp_ms,
+            true
+        );
+        assert_eq!(seen[2].1.event.aggregate_id, Some(2));
+    }
+
+    #[test]
+    fn scan_log_entries_rebuilds_aggregate_index() {
         use tempfile::NamedTempFile;
 
         let file = NamedTempFile::new().unwrap();
         let path = file.path();
 
-        let events = scan_log(path).unwrap();
-        assert!(events.is_empty());
+        let _ = append_event(path, &mock_event(1));
+        let _ = append_event(path, &mock_event(1));
+        let _ = append_event(path, &mock_event(2));
+
+        let mut index: HashMap<u64, Vec<u64>> = HashMap::new();
+
+        scan_log_entries(&path, |offset, event| {
+            index
+                .entry(event.event.aggregate_id.unwrap())
+                .or_default()
+                .push(offset);
+        })
+        .unwrap();
+
+        assert_eq!(index[&1].len(), 2);
+        assert_eq!(index[&2].len(), 1);
     }
 
     #[test]
-    fn scan_log_ignores_trailing_partial_event() {
+    fn scan_log_entries_ignores_trailing_partial_event() {
         use std::fs::OpenOptions;
         use std::io::Write;
         use tempfile::NamedTempFile;
@@ -207,12 +275,38 @@ mod tests {
         f.write_all(&bogus_len.to_be_bytes()).unwrap();
         f.flush().unwrap();
 
-        // scan_log should return ONLY the valid events
-        let events = scan_log(path).unwrap();
+        // seen should contain ONLY the valid events
+        let mut seen = Vec::new();
 
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].1.event.aggregate_id, Some(1));
-        assert_eq!(events[1].1.event.aggregate_id, Some(1));
+        scan_log_entries(&path, |offset, event| {
+            seen.push((offset, event));
+        })
+        .unwrap();
+
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].1.event.aggregate_id, Some(1));
+        assert_eq!(seen[1].1.event.aggregate_id, Some(1));
+    }
+
+    #[test]
+    fn scan_stops_cleanly_on_truncated_entry() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+
+        let _ = append_event(path, &mock_event(1));
+
+        // Truncate mid-entry
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(file.metadata().unwrap().len() - 3).unwrap();
+
+        let mut count = 0;
+
+        scan_log_entries(&path, |_, _| {
+            count += 1;
+        })
+        .unwrap();
+
+        assert_eq!(count, 0);
     }
 
     #[test]
