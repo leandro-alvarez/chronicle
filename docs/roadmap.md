@@ -50,7 +50,23 @@ fn load_index(path: &Path) -> Result<AggregateIndex, StorageError>
 
 ---
 
-### 4. Checksum Per Entry
+### 4. Incremental Index Rebuild
+
+Rebuild the index starting from a specific offset.
+
+```rust
+fn rebuild_index_from(offset: u64) -> Result<AggregateIndex, StorageError>
+```
+
+**Why:** Falls out naturally from the replay API and simplifies the incremental rebuild logic needed for persisted indexes. When loading a stale index, only replay from where it left off.
+
+**Notes:**
+- Uses `replay(from_offset)` internally
+- Can be combined with an existing index via merge
+
+---
+
+### 5. Checksum Per Entry
 
 Add CRC32 checksum to each event for corruption detection.
 
@@ -72,7 +88,7 @@ Add CRC32 checksum to each event for corruption detection.
 
 ---
 
-### 5. Log Metadata Header
+### 6. Log Metadata Header
 
 Add a header at the start of each log file.
 
@@ -96,7 +112,7 @@ struct LogHeader {
 
 ---
 
-### 6. Clear Durability Contract
+### 7. Clear Durability Contract
 
 Expose two append variants with explicit durability guarantees.
 
@@ -124,6 +140,58 @@ These features may be added later but are not blocking:
 | Compaction | Remove old entries (for WAL use case) |
 | Custom error types | Replace `io::Error` with `StorageError` enum |
 | Builder pattern | Ergonomic event construction |
+
+---
+
+## Design Principles
+
+### Offsets Are the Source of Truth
+
+Offsets are the only reliable ordering mechanism. Timestamps can be duplicated, out of order, or clock-skewed. All replay and indexing is based on offsets.
+
+**Aggregate index stores offsets only:**
+```rust
+pub type AggregateIndex = HashMap<u64, Vec<u64>>;  // aggregate_id -> offsets
+```
+
+No need to store timestamps in the index — the event payload contains it when read.
+
+### Chronicle Controls `write_timestamp_ms`
+
+The `write_timestamp_ms` field is set by Chronicle when the event is appended, not by the caller. This is enforced through separate input/output types.
+
+| Field | Who controls | Purpose |
+|-------|--------------|---------|
+| `offset` | Chronicle | Physical position in log |
+| `write_timestamp_ms` | Chronicle | When Chronicle accepted the event |
+| `payload` | Caller | Business data (can include own timestamps) |
+
+**Why:**
+- Storage metadata belongs to the storage layer
+- Callers can't be trusted to provide accurate/consistent timestamps
+- Prevents out-of-order timestamps from misleading consumers
+- Clear separation: Chronicle controls storage metadata, callers control payload
+
+If a caller needs "when the event occurred" (business time), they put it in the payload.
+
+**Implementation (DONE):**
+```rust
+/// Input: provided by caller
+pub struct Event {
+    pub event_type: String,
+    pub namespace: String,
+    pub schema_id: String,
+    pub schema_version: u32,
+    pub aggregate_id: Option<u64>,
+    pub payload: Value,
+}
+
+/// Output: returned when reading from log
+pub struct StoredEvent {
+    pub write_timestamp_ms: u64,  // set by Chronicle
+    pub event: Event,
+}
+```
 
 ---
 
